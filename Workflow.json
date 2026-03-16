@@ -1,0 +1,259 @@
+{
+  "name": "Jira Peer Review Auto-Assign",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "jira-peer-review",
+        "responseMode": "onReceived",
+        "responseData": "firstEntryJson",
+        "options": {}
+      },
+      "id": "node_webhook",
+      "name": "Jira Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "jira-peer-review-trigger"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Extract key fields from Jira webhook payload ──────────────\nconst body = $input.first().json.body ?? $input.first().json;\n\nconst issue         = body.issue ?? {};\nconst changelog     = body.changelog ?? { items: [] };\nconst fields        = issue.fields ?? {};\n\n// Find the status transition in changelog\nconst statusChange = changelog.items.find(i => i.field === 'status');\nconst toStatus     = statusChange?.toString ?? fields?.status?.name ?? '';\n\n// Guard: only proceed when moved TO Peer Review\nconst isPeerReview = toStatus.toLowerCase().includes('peer review');\nif (!isPeerReview) {\n  return [{ json: { skip: true, reason: 'Not a peer review transition' } }];\n}\n\nconst issueKey      = issue.key;\nconst issueId       = issue.id;\nconst summary       = fields.summary ?? '';\nconst storyPoints   = fields.story_points ?? fields.customfield_10016 ?? fields.customfield_10028 ?? 0;\nconst authorId      = fields.assignee?.accountId ?? '';\nconst authorName    = fields.assignee?.displayName ?? 'Unknown';\nconst projectKey    = fields.project?.key ?? '';\nconst boardId       = body.boardId ?? '';\n\nreturn [{\n  json: {\n    skip: false,\n    issueKey,\n    issueId,\n    summary,\n    storyPoints,\n    authorId,\n    authorName,\n    projectKey,\n    boardId\n  }\n}];\n"
+      },
+      "id": "node_extract",
+      "name": "Extract Issue Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.skip }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "node_guard",
+      "name": "Is Peer Review?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "url": "=https://{{ $vars.JIRA_DOMAIN }}/rest/agile/1.0/board/{{ $vars.JIRA_BOARD_ID }}/sprint?state=active",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": false
+            }
+          }
+        }
+      },
+      "id": "node_get_sprint",
+      "name": "Get Active Sprint",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [900, 220],
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "jira_basic_auth",
+          "name": "Jira Basic Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "=https://{{ $vars.JIRA_DOMAIN }}/rest/agile/1.0/board/{{ $vars.JIRA_BOARD_ID }}/sprint/{{ $json.values[0].id }}/issue?jql=status%3D%22In%20Progress%22%20AND%20assignee%20is%20not%20EMPTY&maxResults=200&fields=assignee,story_points,customfield_10016,customfield_10028,summary,status",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "options": {}
+      },
+      "id": "node_get_issues",
+      "name": "Get In-Progress Issues",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1120, 220],
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "jira_basic_auth",
+          "name": "Jira Basic Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Tally story points per team member ───────────────────────\nconst issues      = $input.first().json.issues ?? [];\nconst authorId    = $('Extract Issue Data').first().json.authorId;\n\n// Build map: accountId → { displayName, email, accountId, points }\nconst pointsMap = {};\n\nfor (const issue of issues) {\n  const f          = issue.fields ?? {};\n  const assignee   = f.assignee;\n  if (!assignee) continue;\n\n  const id    = assignee.accountId;\n  const name  = assignee.displayName;\n  const email = assignee.emailAddress ?? '';\n  const pts   = f.customfield_10016 ?? f.customfield_10028 ?? f.story_points ?? 0;\n\n  if (!pointsMap[id]) {\n    pointsMap[id] = { accountId: id, displayName: name, email, points: 0 };\n  }\n  pointsMap[id].points += Number(pts) || 0;\n}\n\n// ── Add team members with 0 in-progress points ─────────────\n// Pull from environment variable: comma-separated list of accountId:name:email\nconst teamRaw = $vars.TEAM_MEMBERS ?? '';\nfor (const entry of teamRaw.split(',')) {\n  const [id, name, email] = entry.trim().split(':');\n  if (!id) continue;\n  if (!pointsMap[id]) {\n    pointsMap[id] = { accountId: id, displayName: name ?? id, email: email ?? '', points: 0 };\n  }\n}\n\n// ── Exclude original author ───────────────────────────────\ndelete pointsMap[authorId];\n\nconst candidates = Object.values(pointsMap);\n\nif (candidates.length === 0) {\n  return [{ json: { error: 'No eligible reviewers found', authorId } }];\n}\n\n// ── Pick reviewer with fewest points (stable sort → first alpha wins ties) ─\ncandidates.sort((a, b) => a.points - b.points || a.displayName.localeCompare(b.displayName));\nconst reviewer = candidates[0];\n\nreturn [{\n  json: {\n    reviewer,\n    allCandidates: candidates,\n    issueKey:    $('Extract Issue Data').first().json.issueKey,\n    summary:     $('Extract Issue Data').first().json.summary,\n    authorName:  $('Extract Issue Data').first().json.authorName\n  }\n}];\n"
+      },
+      "id": "node_pick_reviewer",
+      "name": "Pick Reviewer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 220]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.error }}",
+              "operation": "isEmpty"
+            }
+          ]
+        }
+      },
+      "id": "node_has_reviewer",
+      "name": "Reviewer Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1560, 220]
+    },
+    {
+      "parameters": {
+        "url": "=https://{{ $vars.JIRA_DOMAIN }}/rest/api/3/issue/{{ $json.issueKey }}/assignee",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "method": "PUT",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "accountId",
+              "value": "={{ $json.reviewer.accountId }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node_assign",
+      "name": "Assign Reviewer in Jira",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1780, 140],
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "jira_basic_auth",
+          "name": "Jira Basic Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "=https://{{ $vars.JIRA_DOMAIN }}/rest/api/3/issue/{{ $('Pick Reviewer').first().json.issueKey }}/comment",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"body\": {\n    \"type\": \"doc\",\n    \"version\": 1,\n    \"content\": [\n      {\n        \"type\": \"paragraph\",\n        \"content\": [\n          { \"type\": \"text\", \"text\": \"🤖 \"},\n          { \"type\": \"text\", \"text\": \"Auto-assigned for peer review: \", \"marks\": [{\"type\":\"strong\"}] },\n          {\n            \"type\": \"mention\",\n            \"attrs\": {\n              \"id\": \"{{ $('Pick Reviewer').first().json.reviewer.accountId }}\",\n              \"text\": \"@{{ $('Pick Reviewer').first().json.reviewer.displayName }}\"\n            }\n          },\n          { \"type\": \"text\", \"text\": \" (lowest in-progress load: {{ $('Pick Reviewer').first().json.reviewer.points }} pts). Original author: {{ $('Pick Reviewer').first().json.authorName }}.\" }\n        ]\n      }\n    ]\n  }\n}",
+        "options": {}
+      },
+      "id": "node_jira_comment",
+      "name": "Post Jira Comment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [2000, 140],
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "jira_basic_auth",
+          "name": "Jira Basic Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "channel": "={{ $('Pick Reviewer').first().json.reviewer.email }}",
+        "text": "=👋 Hey *{{ $('Pick Reviewer').first().json.reviewer.displayName }}*!\n\nYou've been auto-assigned to peer review a story:\n\n*{{ $('Pick Reviewer').first().json.summary }}*\n🔗 https://{{ $vars.JIRA_DOMAIN }}/browse/{{ $('Pick Reviewer').first().json.issueKey }}\n\nYou were picked because you have the lightest in-progress load on the board right now ({{ $('Pick Reviewer').first().json.reviewer.points }} pts). You're the hero we need! 🚀\n\n_This was assigned automatically. If you're unavailable, please reassign manually._",
+        "otherOptions": {}
+      },
+      "id": "node_slack",
+      "name": "Slack DM to Reviewer",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [2220, 140],
+      "credentials": {
+        "slackOAuth2Api": {
+          "id": "slack_oauth",
+          "name": "Slack OAuth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "=https://{{ $vars.JIRA_DOMAIN }}/rest/api/3/issue/{{ $('Extract Issue Data').first().json.issueKey }}/comment",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"body\": {\n    \"type\": \"doc\",\n    \"version\": 1,\n    \"content\": [\n      {\n        \"type\": \"paragraph\",\n        \"content\": [\n          { \"type\": \"text\", \"text\": \"⚠️ Auto-assignment skipped: no eligible reviewers found (all team members may be the original author, or TEAM_MEMBERS env var is not configured).\" }\n        ]\n      }\n    ]\n  }\n}",
+        "options": {}
+      },
+      "id": "node_no_reviewer",
+      "name": "Comment: No Reviewer Found",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1780, 360],
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "jira_basic_auth",
+          "name": "Jira Basic Auth"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Jira Webhook": {
+      "main": [[{ "node": "Extract Issue Data", "type": "main", "index": 0 }]]
+    },
+    "Extract Issue Data": {
+      "main": [[{ "node": "Is Peer Review?", "type": "main", "index": 0 }]]
+    },
+    "Is Peer Review?": {
+      "main": [
+        [{ "node": "Comment: No Reviewer Found", "type": "main", "index": 0 }],
+        [{ "node": "Get Active Sprint", "type": "main", "index": 0 }]
+      ]
+    },
+    "Get Active Sprint": {
+      "main": [[{ "node": "Get In-Progress Issues", "type": "main", "index": 0 }]]
+    },
+    "Get In-Progress Issues": {
+      "main": [[{ "node": "Pick Reviewer", "type": "main", "index": 0 }]]
+    },
+    "Pick Reviewer": {
+      "main": [[{ "node": "Reviewer Found?", "type": "main", "index": 0 }]]
+    },
+    "Reviewer Found?": {
+      "main": [
+        [{ "node": "Comment: No Reviewer Found", "type": "main", "index": 0 }],
+        [{ "node": "Assign Reviewer in Jira", "type": "main", "index": 0 }]
+      ]
+    },
+    "Assign Reviewer in Jira": {
+      "main": [[{ "node": "Post Jira Comment", "type": "main", "index": 0 }]]
+    },
+    "Post Jira Comment": {
+      "main": [[{ "node": "Slack DM to Reviewer", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": ["jira", "peer-review", "automation"],
+  "triggerCount": 1,
+  "updatedAt": "2026-01-01T00:00:00.000Z",
+  "versionId": "1"
+}
