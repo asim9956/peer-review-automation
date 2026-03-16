@@ -1,0 +1,50 @@
+version: "3.8"
+
+services:
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n_peer_review
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      # ── Core ──────────────────────────────────────────────
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - WEBHOOK_URL=http://localhost:5678/
+
+      # ── Auth (change these!) ───────────────────────────────
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=admin
+      - N8N_BASIC_AUTH_PASSWORD=changeme123
+
+      # ── Timezone ──────────────────────────────────────────
+      - GENERIC_TIMEZONE=Asia/Kolkata
+      - TZ=Asia/Kolkata
+
+      # ── Persistence ───────────────────────────────────────
+      - DB_TYPE=sqlite
+      - DB_SQLITE_VACUUM_ON_STARTUP=true
+
+      # ── Execution settings ────────────────────────────────
+      - EXECUTIONS_PROCESS=main
+      - EXECUTIONS_DATA_SAVE_ON_ERROR=all
+      - EXECUTIONS_DATA_SAVE_ON_SUCCESS=last
+      - EXECUTIONS_DATA_MAX_AGE=168        # keep logs 7 days
+
+      # ── Security ──────────────────────────────────────────
+      - N8N_SECURE_COOKIE=false            # set true when behind HTTPS
+
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:5678/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  n8n_data:
+    driver: local
